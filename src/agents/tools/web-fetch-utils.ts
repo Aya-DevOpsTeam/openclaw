@@ -1,64 +1,246 @@
-/**
- * web_fetch extraction utilities.
- *
- * Converts lightweight HTML into bounded markdown/text without pulling in a full renderer.
- */
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
-import { decodeHtmlEntityAt } from "../utils/html.js";
-import { sanitizeHtml, stripInvisibleUnicode } from "./web-fetch-visibility.js";
+import {
+  RAW_TEXT_TAGS,
+  readRawTextOpenTagName,
+  findRawTextOpenTagStart,
+  startsLikeHtmlTag,
+  readTagToken,
+  readRawTextBounds,
+  skipRawTextElement,
+} from "../../../packages/markdown-core/src/html-scanner.js";
+import { stripInvisibleUnicode } from "../../infra/unicode-visibility.js";
+import { decodeHtmlEntities } from "../../shared/html-entities.js";
+import { readHtmlAttribute } from "./web-fetch-attributes.js";
+import { sanitizeHtml } from "./web-fetch-visibility.js";
 
-/** Output mode requested by web_fetch extraction. */
 export type ExtractMode = "markdown" | "text";
 
-const HTML_TAG_RE = /<[^>]+>/g;
-const SCRIPT_TAG_BLOCK_RE = /<script[\s\S]*?<\/script>/gi;
-const STYLE_TAG_BLOCK_RE = /<style[\s\S]*?<\/style>/gi;
-const NOSCRIPT_TAG_BLOCK_RE = /<noscript[\s\S]*?<\/noscript>/gi;
-const SCRIPT_STYLE_NOSCRIPT_OPEN_RE = /<(?:script|style|noscript)\b/i;
-const ANCHOR_OPEN_RE = /<a\s/i;
-const ANCHOR_RE = /<a\s+[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
-const HEADING_OPEN_RE = /<h[1-6]\b/i;
-const HEADING_RE = /<h([1-6])[^>]*>([\s\S]*?)<\/h\1>/gi;
-const LIST_ITEM_OPEN_RE = /<li\b/i;
-const LIST_ITEM_RE = /<li[^>]*>([\s\S]*?)<\/li>/gi;
-const BLOCK_BREAK_RE =
-  /<(?:br|hr)\s*\/?>|<\/(?:p|div|section|article|header|footer|table|tr|ul|ol)>/gi;
+const BLOCK_BREAK_TAGS = new Set([
+  "p",
+  "div",
+  "section",
+  "article",
+  "header",
+  "footer",
+  "table",
+  "tr",
+  "ul",
+  "ol",
+]);
+// Keep malformed nested markup from making end-of-document context unwind quadratic.
+// web_fetch favors bounded, auditable text over preserving deep broken HTML structure.
+const MAX_RENDER_CONTEXT_DEPTH = 32;
 
-// Decode entities through the canonical shared decoder (agents/utils/html.ts) so web_fetch and the
-// renderer share one entity contract — the divergent hand-rolled copy here was what truncated astral
-// entities. A single left-to-right pass also avoids double-decoding "&amp;#39;" into "'", because the
-// "&amp;" is consumed before its following "#39;" is ever seen as an entity.
+type RenderContext =
+  | { kind: "root"; parts: string[] }
+  | { kind: "title"; parts: string[] }
+  | { kind: "anchor"; href: string | undefined; hasText: boolean; parts: string[] }
+  | { kind: "heading"; level: number; parts: string[] }
+  | { kind: "list-item"; parts: string[] };
+
 function decodeEntities(value: string): string {
-  if (!value.includes("&")) {
-    return value;
+  // Display extraction historically accepted mixed-case &nbsp; and treats non-breaking spaces as
+  // ordinary collapsible whitespace. Normalize it before the shared decoder to stay single-pass.
+  return decodeHtmlEntities(value.replace(/&nbsp;/gi, "\u00a0")).replaceAll("\u00a0", " ");
+}
+
+function readAnchorHref(rawTag: string): string | undefined {
+  const value = readHtmlAttribute(rawTag, "href", "render");
+  return value === undefined ? undefined : decodeEntities(value);
+}
+
+function appendText(stack: RenderContext[], value: string): void {
+  const context = stack[stack.length - 1];
+  context?.parts.push(value);
+  if (context?.kind === "anchor" && /\S/.test(value)) {
+    context.hasText = true;
   }
-  let out = "";
-  for (let i = 0; i < value.length; i += 1) {
-    if (value[i] === "&") {
-      // &nbsp; is not an escapable entity in the shared decoder; render it as a space.
-      if (value.slice(i, i + 6).toLowerCase() === "&nbsp;") {
-        out += " ";
-        i += 5;
-        continue;
+}
+
+function closeContext(
+  context: RenderContext,
+  parent: RenderContext,
+  state: { title?: string },
+): void {
+  const label = normalizeWhitespace(context.parts.join(""));
+  if (!label && context.kind !== "title" && !(context.kind === "anchor" && context.href)) {
+    return;
+  }
+  if (context.kind === "title") {
+    state.title ??= label || undefined;
+    return;
+  }
+  if (parent.kind === "title") {
+    parent.parts.push(label);
+    return;
+  }
+  switch (context.kind) {
+    case "root":
+      return;
+    case "anchor":
+      parent.parts.push(
+        context.href && label ? `[${label}](${context.href})` : label || context.href || "",
+      );
+      return;
+    case "heading":
+      if (parent.kind === "anchor") {
+        parent.parts.push(label);
+        parent.hasText ||= Boolean(label);
+      } else {
+        parent.parts.push(`\n${"#".repeat(context.level)} ${label}\n`);
       }
-      const decoded = decodeHtmlEntityAt(value, i);
-      if (decoded) {
-        out += decoded.text;
-        i += decoded.length - 1;
-        continue;
+      return;
+    case "list-item":
+      if (parent.kind === "anchor") {
+        parent.hasText ||= Boolean(label);
       }
+      parent.parts.push(`\n- ${label}`);
+  }
+}
+
+function closeTopContext(stack: RenderContext[], state: { title?: string }): void {
+  const context = stack.pop()!;
+  closeContext(context, stack[stack.length - 1]!, state);
+}
+
+function closeThroughContext(
+  stack: RenderContext[],
+  kind: RenderContext["kind"],
+  state: { title?: string },
+  requireAnchorText = false,
+): boolean {
+  for (let i = stack.length - 1; i > 0; i -= 1) {
+    const context = stack[i];
+    if (context?.kind === kind) {
+      if (requireAnchorText && context.kind === "anchor" && !context.hasText) {
+        return false;
+      }
+      while (stack.length > i) {
+        closeTopContext(stack, state);
+      }
+      return true;
     }
-    out += value[i];
   }
-  return out;
+  return false;
 }
 
-function stripTags(value: string): string {
-  const withoutTags = value.includes("<") ? value.replace(HTML_TAG_RE, "") : value;
-  return decodeEntities(withoutTags);
+function pushContext(
+  stack: RenderContext[],
+  context: Exclude<RenderContext, { kind: "root" }>,
+  state: { title?: string },
+): void {
+  while (stack.length >= MAX_RENDER_CONTEXT_DEPTH) {
+    closeTopContext(stack, state);
+  }
+  stack.push(context);
 }
 
-/** Collapses display whitespace while preserving paragraph breaks. */
+export function htmlToMarkdown(html: string): { text: string; title?: string } {
+  const root: RenderContext = { kind: "root", parts: [] };
+  const stack: RenderContext[] = [root];
+  const state: { title?: string } = {};
+
+  for (let i = 0; i < html.length;) {
+    const ch = html[i];
+    if (ch !== "<") {
+      const nextTag = html.indexOf("<", i);
+      const end = nextTag === -1 ? html.length : nextTag;
+      appendText(stack, decodeEntities(html.slice(i, end)));
+      i = end;
+      continue;
+    }
+
+    const rawTextTagName = readRawTextOpenTagName(html, i);
+    if (rawTextTagName) {
+      i = skipRawTextElement(html, i, rawTextTagName);
+      continue;
+    }
+
+    if (!startsLikeHtmlTag(html, i)) {
+      appendText(stack, "<");
+      i += 1;
+      continue;
+    }
+
+    const read = readTagToken(html, i);
+    if (!read) {
+      const rawTextStart = findRawTextOpenTagStart(html, i + 1, html.length);
+      if (rawTextStart !== -1) {
+        i = rawTextStart;
+        continue;
+      }
+      break;
+    }
+    const { token, next } = read;
+    i = next;
+    if (!token) {
+      continue;
+    }
+
+    if (token.closing) {
+      if (token.name === "title") {
+        closeThroughContext(stack, "title", state);
+      } else if (token.name === "a") {
+        closeThroughContext(stack, "anchor", state);
+      } else if (/^h[1-6]$/.test(token.name)) {
+        closeThroughContext(stack, "heading", state);
+      } else if (token.name === "li") {
+        closeThroughContext(stack, "list-item", state);
+      } else if (BLOCK_BREAK_TAGS.has(token.name)) {
+        appendText(stack, "\n");
+      }
+      continue;
+    }
+
+    if (RAW_TEXT_TAGS.has(token.name)) {
+      i = readRawTextBounds(html, token.name, i).end;
+      continue;
+    }
+    if (BLOCK_BREAK_TAGS.has(token.name) && closeThroughContext(stack, "anchor", state, true)) {
+      appendText(stack, " ");
+    }
+    if (token.name === "br" || token.name === "hr") {
+      appendText(stack, "\n");
+      continue;
+    }
+    if (token.name === "title" && !token.selfClosing) {
+      pushContext(stack, { kind: "title", parts: [] }, state);
+      continue;
+    }
+    if (token.name === "a" && !token.selfClosing) {
+      closeThroughContext(stack, "anchor", state);
+      pushContext(
+        stack,
+        { kind: "anchor", href: readAnchorHref(token.raw), hasText: false, parts: [] },
+        state,
+      );
+      continue;
+    }
+    if (/^h[1-6]$/.test(token.name) && !token.selfClosing) {
+      closeThroughContext(stack, "anchor", state, true);
+      pushContext(
+        stack,
+        { kind: "heading", level: Number.parseInt(token.name[1] ?? "1", 10), parts: [] },
+        state,
+      );
+      continue;
+    }
+    if (token.name === "li" && !token.selfClosing) {
+      closeThroughContext(stack, "anchor", state, true);
+      pushContext(stack, { kind: "list-item", parts: [] }, state);
+    }
+  }
+
+  while (stack.length > 1) {
+    closeTopContext(stack, state);
+  }
+
+  return {
+    text: normalizeWhitespace(root.parts.join("")),
+    title: state.title,
+  };
+}
+
 export function normalizeWhitespace(value: string): string {
   return value
     .replace(/\r/g, "")
@@ -68,63 +250,52 @@ export function normalizeWhitespace(value: string): string {
     .trim();
 }
 
-/** Converts sanitized HTML into coarse markdown plus an optional title. */
-export function htmlToMarkdown(html: string): { text: string; title?: string } {
-  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch ? normalizeWhitespace(stripTags(titleMatch[1])) : undefined;
-  let text = html;
-  if (SCRIPT_STYLE_NOSCRIPT_OPEN_RE.test(text)) {
-    text = text
-      .replace(SCRIPT_TAG_BLOCK_RE, "")
-      .replace(STYLE_TAG_BLOCK_RE, "")
-      .replace(NOSCRIPT_TAG_BLOCK_RE, "");
-  }
-  if (ANCHOR_OPEN_RE.test(text)) {
-    text = text.replace(ANCHOR_RE, (_, href, body) => {
-      const label = normalizeWhitespace(stripTags(body));
-      if (!label) {
-        return href;
-      }
-      // Preserve link targets in markdown mode so fetched pages remain source-auditable.
-      return `[${label}](${href})`;
-    });
-  }
-  if (HEADING_OPEN_RE.test(text)) {
-    text = text.replace(HEADING_RE, (_, level, body) => {
-      const prefix = "#".repeat(Math.max(1, Math.min(6, Number.parseInt(level, 10))));
-      const label = normalizeWhitespace(stripTags(body));
-      return `\n${prefix} ${label}\n`;
-    });
-  }
-  if (LIST_ITEM_OPEN_RE.test(text)) {
-    text = text.replace(LIST_ITEM_RE, (_, body) => {
-      const label = normalizeWhitespace(stripTags(body));
-      return label ? `\n- ${label}` : "";
-    });
-  }
-  text = text.replace(BLOCK_BREAK_RE, "\n");
-  text = stripTags(text);
-  text = normalizeWhitespace(text);
-  return { text, title };
-}
-
-/** Removes markdown decoration for plain text extraction. */
 export function markdownToText(markdown: string): string {
-  let text = markdown;
+  const codeBlocks: string[] = [];
+  let text = "";
+  let pos = 0;
+  while (pos < markdown.length) {
+    const open = markdown.indexOf("```", pos);
+    if (open === -1) {
+      text += markdown.slice(pos).replaceAll("\0", "\0\0");
+      break;
+    }
+    text += markdown.slice(pos, open).replaceAll("\0", "\0\0");
+    const afterOpen = open + 3;
+    const close = markdown.indexOf("```", afterOpen);
+    if (close === -1) {
+      text += markdown.slice(open).replaceAll("\0", "\0\0");
+      break;
+    }
+    const firstLineEnd = markdown.indexOf("\n", afterOpen);
+    const contentStart = firstLineEnd === -1 || firstLineEnd > close ? afterOpen : firstLineEnd + 1;
+    const code = markdown.slice(contentStart, close);
+    // Keep the surrounding prose connected without interpreting the code as Markdown.
+    // Preserve its final line boundary for heading/list markers after the closing fence.
+    const lineEnd = /[\r\n\u2028\u2029]$/.test(code) ? code.slice(-1) : "";
+    const literal = code.slice(0, code.length - lineEnd.length);
+    if (literal) {
+      text += `\0${codeBlocks.length}\0`;
+      codeBlocks.push(literal);
+    }
+    text += lineEnd;
+    pos = close + 3;
+  }
   text = text.replace(/!\[[^\]]*]\([^)]+\)/g, "");
   text = text.replace(/\[([^\]]+)]\([^)]+\)/g, "$1");
-  text = text.replace(/```[\s\S]*?```/g, (block) =>
-    block.replace(/```[^\n]*\n?/g, "").replace(/```/g, ""),
-  );
   text = text.replace(/`([^`]+)`/g, "$1");
   text = text.replace(/^#{1,6}\s+/gm, "");
-  text = text.replace(/^\s*[-*+]\s+/gm, "");
-  text = text.replace(/^\s*\d+\.\s+/gm, "");
+  text = text.replace(/^[^\S\n]*[-*+]\s+/gm, "");
+  text = text.replace(/^[^\S\n]*\d+\.\s+/gm, "");
+  // Escaped input NUL pairs stay paired through prose formatting, so only our
+  // single-NUL markers can restore code. Replacement output is not rescanned.
+  text = text.replace(/\0(?:\0|(\d+)\0)/g, (_match, index: string | undefined) =>
+    index === undefined ? "\0" : codeBlocks[Number(index)]!,
+  );
   return normalizeWhitespace(text);
 }
 
-/** Truncates text by characters and reports whether truncation occurred. */
-export function truncateText(
+export function truncateWebFetchText(
   value: string,
   maxChars: number,
 ): { text: string; truncated: boolean } {
@@ -134,19 +305,17 @@ export function truncateText(
   return { text: truncateUtf16Safe(value, maxChars), truncated: true };
 }
 
-/** Sanitizes HTML and extracts either markdown or plain text content. */
 export async function extractBasicHtmlContent(params: {
   html: string;
   extractMode: ExtractMode;
 }): Promise<{ text: string; title?: string } | null> {
   const cleanHtml = await sanitizeHtml(params.html);
   const rendered = htmlToMarkdown(cleanHtml);
-  if (params.extractMode === "text") {
-    const text =
-      stripInvisibleUnicode(markdownToText(rendered.text)) ||
-      stripInvisibleUnicode(normalizeWhitespace(stripTags(cleanHtml)));
-    return text ? { text, title: rendered.title } : null;
-  }
-  const text = stripInvisibleUnicode(rendered.text);
+  const text =
+    stripInvisibleUnicode(
+      params.extractMode === "text" ? markdownToText(rendered.text) : rendered.text,
+    ) ||
+    stripInvisibleUnicode(rendered.title ?? "") ||
+    stripInvisibleUnicode(rendered.text);
   return text ? { text, title: rendered.title } : null;
 }

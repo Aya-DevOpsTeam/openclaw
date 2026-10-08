@@ -1,7 +1,8 @@
-import { LitElement, html } from "lit";
+import { html, nothing } from "lit";
 import { property } from "lit/decorators.js";
 import type { ThemeMode } from "../app/theme.ts";
 import { t } from "../i18n/index.ts";
+import { OpenClawLightDomContentsElement } from "../lit/openclaw-element.ts";
 import { icons } from "./icons.ts";
 import "./tooltip.ts";
 
@@ -10,22 +11,12 @@ export type ThemeModeChangeDetail = {
   element: HTMLElement;
 };
 
-export class ThemeModeToggle extends LitElement {
-  override createRenderRoot() {
-    return this;
-  }
-
+class ThemeModeToggle extends OpenClawLightDomContentsElement {
   @property({ attribute: false }) mode: ThemeMode = "system";
+  @property({ attribute: false }) menuItem = false;
 
-  override connectedCallback() {
-    super.connectedCallback();
-    this.style.display = "contents";
-  }
-
-  private readonly handleModeChange = (mode: ThemeMode, event: Event) => {
-    if (mode === this.mode) {
-      return;
-    }
+  private readonly handleModeChange = (event: Event) => {
+    const mode = this.mode === "system" ? "light" : this.mode === "light" ? "dark" : "system";
     this.dispatchEvent(
       new CustomEvent<ThemeModeChangeDetail>("theme-change", {
         detail: { mode, element: event.currentTarget as HTMLElement },
@@ -36,38 +27,27 @@ export class ThemeModeToggle extends LitElement {
   };
 
   override render() {
-    const options: Array<{ id: ThemeMode; labelKey: string }> = [
-      { id: "system", labelKey: "common.system" },
-      { id: "light", labelKey: "common.light" },
-      { id: "dark", labelKey: "common.dark" },
-    ];
+    const labelKey =
+      this.mode === "system"
+        ? "common.system"
+        : this.mode === "light"
+          ? "common.light"
+          : "common.dark";
+    const label = t(labelKey);
+    const tooltip = t("common.colorModeOption", { mode: label });
 
     return html`
-      <div class="theme-mode-toggle" role="group" aria-label=${t("common.colorMode")}>
-        ${options.map((option) => {
-          const label = t(option.labelKey);
-          const tooltip = t("common.colorModeOption", { mode: label });
-          return html`
-            <openclaw-tooltip .content=${tooltip}>
-              <button
-                type="button"
-                class="theme-mode-toggle__btn ${option.id === this.mode
-                  ? "theme-mode-toggle__btn--active"
-                  : ""}"
-                aria-label=${tooltip}
-                aria-pressed=${option.id === this.mode}
-                @click=${(event: Event) => this.handleModeChange(option.id, event)}
-              >
-                ${option.id === "system"
-                  ? icons.monitor
-                  : option.id === "light"
-                    ? icons.sun
-                    : icons.moon}
-              </button>
-            </openclaw-tooltip>
-          `;
-        })}
-      </div>
+      <openclaw-tooltip .content=${tooltip}>
+        <button
+          type="button"
+          class="theme-mode-toggle"
+          role=${this.menuItem ? "menuitem" : nothing}
+          aria-label=${tooltip}
+          @click=${this.handleModeChange}
+        >
+          ${this.mode === "system" ? icons.monitor : this.mode === "light" ? icons.sun : icons.moon}
+        </button>
+      </openclaw-tooltip>
     `;
   }
 }

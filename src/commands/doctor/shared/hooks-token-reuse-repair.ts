@@ -10,56 +10,38 @@ import { randomToken } from "../../random-token.js";
 import type { DoctorConfigMutationResult } from "./config-mutation-state.js";
 
 function activeGatewaySharedSecret(auth: ResolvedGatewayAuth): string {
-  if (auth.mode === "token") {
-    return normalizeOptionalString(auth.token) ?? "";
-  }
-  if (auth.mode === "password" || auth.mode === "trusted-proxy") {
-    return normalizeOptionalString(auth.password) ?? "";
-  }
-  return "";
+  const secret =
+    auth.mode === "token"
+      ? auth.token
+      : auth.mode === "password" || auth.mode === "trusted-proxy"
+        ? auth.password
+        : undefined;
+  return normalizeOptionalString(secret) ?? "";
 }
 
 /** Rotate hooks.token when it matches the active Gateway token/password shared secret. */
-export function repairHooksTokenReuseGatewayAuth(
+export async function repairHooksTokenReuseGatewayAuth(
   cfg: OpenClawConfig,
   env: NodeJS.ProcessEnv = process.env,
   createToken: () => string = randomToken,
-): Promise<DoctorConfigMutationResult> {
-  return repairHooksTokenReuseGatewayAuthAfterMaterializingRefs(cfg, env, createToken);
-}
-
-async function materializeDoctorGatewayAuthRefs(
-  cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv,
-): Promise<OpenClawConfig> {
-  const materializeParams = {
-    cfg,
-    env,
-    mode: cfg.gateway?.auth?.mode,
-    hasTokenCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
-    hasPasswordCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
-  };
-  if (!canMaterializeGatewayAuthSecretRefsWithoutExec(materializeParams)) {
-    return cfg;
-  }
-  try {
-    return await materializeGatewayAuthSecretRefs(materializeParams);
-  } catch {
-    return cfg;
-  }
-}
-
-async function repairHooksTokenReuseGatewayAuthAfterMaterializingRefs(
-  cfg: OpenClawConfig,
-  env: NodeJS.ProcessEnv,
-  createToken: () => string,
 ): Promise<DoctorConfigMutationResult> {
   const hooksToken = normalizeOptionalString(cfg.hooks?.token) ?? "";
   if (cfg.hooks?.enabled !== true || !hooksToken) {
     return { config: cfg, changes: [] };
   }
 
-  const materializedCfg = await materializeDoctorGatewayAuthRefs(cfg, env);
+  const materializeParams = {
+    cfg,
+    env,
+    mode: cfg.gateway?.auth?.mode,
+    hasTokenOverride: false,
+    hasPasswordOverride: false,
+    hasTokenFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
+    hasPasswordFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
+  };
+  const materializedCfg = await (canMaterializeGatewayAuthSecretRefsWithoutExec(materializeParams)
+    ? materializeGatewayAuthSecretRefs(materializeParams).catch(() => cfg)
+    : cfg);
   const auth = resolveGatewayAuth({
     authConfig: materializedCfg.gateway?.auth,
     tailscaleMode: materializedCfg.gateway?.tailscale?.mode ?? "off",

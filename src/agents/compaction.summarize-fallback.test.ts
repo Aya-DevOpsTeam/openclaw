@@ -2,12 +2,13 @@
 import type { AgentMessage } from "openclaw/plugin-sdk/agent-core";
 import type { ExtensionContext } from "openclaw/plugin-sdk/agent-sessions";
 import type { UserMessage } from "openclaw/plugin-sdk/llm";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { summarizeWithFallback } from "./compaction.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CompactionError } from "../../packages/agent-core/src/harness/types.js";
+import { makeUserMessage } from "../../test/helpers/user-message.js";
+import { summarizeInStages } from "./compaction.js";
 
 const agentSessionMocks = vi.hoisted(() => ({
   generateSummary: vi.fn(),
-  estimateTokens: vi.fn((_message: unknown) => 100),
 }));
 
 vi.mock("openclaw/plugin-sdk/agent-sessions", async () => {
@@ -17,7 +18,6 @@ vi.mock("openclaw/plugin-sdk/agent-sessions", async () => {
   return {
     ...actual,
     generateSummary: agentSessionMocks.generateSummary,
-    estimateTokens: agentSessionMocks.estimateTokens,
   };
 });
 
@@ -26,7 +26,6 @@ vi.mock("./sessions/index.js", async () => {
   return {
     ...actual,
     generateSummary: agentSessionMocks.generateSummary,
-    estimateTokens: agentSessionMocks.estimateTokens,
   };
 });
 
@@ -38,39 +37,25 @@ const testModel = {
   maxTokens: 8192,
 } as unknown as NonNullable<ExtensionContext["model"]>;
 
-describe("summarizeWithFallback", () => {
+async function finishAssertionWithTimers(assertion: Promise<unknown>): Promise<void> {
+  // The async clock drain yields native turns. Observe failures immediately,
+  // then rethrow only after the drain finishes.
+  void assertion.catch(() => undefined);
+  await vi.runAllTimersAsync();
+  await assertion;
+}
+
+describe("compaction summarization fallback", () => {
   beforeEach(() => {
+    vi.useFakeTimers();
     agentSessionMocks.generateSummary.mockReset();
     agentSessionMocks.generateSummary.mockRejectedValue(
       new Error("Summarization failed: fetch failed"),
     );
-    agentSessionMocks.estimateTokens.mockReset();
-    agentSessionMocks.estimateTokens.mockImplementation(() => 100);
   });
 
-  it("does not duplicate summarization when no messages were oversized", async () => {
-    const messages: AgentMessage[] = [
-      {
-        role: "user",
-        content: "hello",
-        timestamp: 1,
-      } satisfies UserMessage,
-    ];
-
-    const result = await summarizeWithFallback({
-      messages,
-      model: testModel,
-      apiKey: "test-key", // pragma: allowlist secret
-      signal: new AbortController().signal,
-      reserveTokens: 1000,
-      maxChunkTokens: 50_000,
-      contextWindow: 200_000,
-    });
-
-    expect(result).toContain("Context contained 1 messages");
-    expect(result).toContain("0 oversized");
-    // "fetch failed" is timeout-classed now, so summarizeChunks does not retry it.
-    expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(1);
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it("retries provider-side AbortError and returns a real summary when caller signal is not aborted", async () => {
@@ -86,14 +71,9 @@ describe("summarizeWithFallback", () => {
       .mockRejectedValueOnce(providerAbortErr)
       .mockResolvedValueOnce("recovered summary after provider disconnect");
 
-    const result = await summarizeWithFallback({
-      messages: [
-        {
-          role: "user",
-          content: "hello",
-          timestamp: 1,
-        } satisfies UserMessage,
-      ],
+    const summary = summarizeInStages({
+      parts: 1,
+      messages: [makeUserMessage("hello", 1) satisfies UserMessage],
       model: testModel,
       apiKey: "test-key", // pragma: allowlist secret
       signal: new AbortController().signal, // not aborted
@@ -102,59 +82,71 @@ describe("summarizeWithFallback", () => {
       contextWindow: 200_000,
     });
 
-    expect(result).toBe("recovered summary after provider disconnect");
+    const result = expect(summary).resolves.toBe("recovered summary after provider disconnect");
+    await finishAssertionWithTimers(result);
     // Two calls: first fails with provider-side AbortError, second succeeds.
     expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(2);
   });
 
-  it("does not retry and propagates AbortError immediately when caller signal is already aborted", async () => {
-    const controller = new AbortController();
-    controller.abort();
+  it("retries a summarization_failed result and persists the recovered summary", async () => {
+    agentSessionMocks.generateSummary
+      .mockRejectedValueOnce(
+        new CompactionError(
+          "summarization_failed",
+          "Summarization failed: model returned no summary text",
+        ),
+      )
+      .mockResolvedValueOnce("recovered non-empty summary");
 
-    const providerAbortErr = Object.assign(new Error("This operation was aborted"), {
-      name: "AbortError",
-    });
-    agentSessionMocks.generateSummary.mockRejectedValueOnce(providerAbortErr);
-
-    await expect(
-      summarizeWithFallback({
-        messages: [
-          {
-            role: "user",
-            content: "hello",
-            timestamp: 1,
-          } satisfies UserMessage,
-        ],
+    const result = expect(
+      summarizeInStages({
+        parts: 1,
+        messages: [makeUserMessage("hello", 1) satisfies UserMessage],
         model: testModel,
         apiKey: "test-key", // pragma: allowlist secret
-        signal: controller.signal, // already aborted
+        signal: new AbortController().signal,
         reserveTokens: 1000,
         maxChunkTokens: 50_000,
         contextWindow: 200_000,
       }),
-    ).rejects.toMatchObject({ name: "AbortError" });
+    ).resolves.toBe("recovered non-empty summary");
+    await finishAssertionWithTimers(result);
+    expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(2);
+  });
 
-    // Caller abort is terminal — no retry, no fallback to placeholder.
+  it("stops retry backoff promptly when the caller aborts mid-sleep", async () => {
+    // The first attempt fails with a retryable error, then the caller aborts
+    // while retryAsync sits in its backoff sleep (>= 500ms minDelay). The
+    // sleep must reject on abort instead of riding out the full delay.
+    const controller = new AbortController();
+    agentSessionMocks.generateSummary.mockRejectedValueOnce(new Error("transient rate limit"));
+
+    const startedAt = Date.now();
+    const promise = summarizeInStages({
+      parts: 1,
+      messages: [makeUserMessage("hello", 1) satisfies UserMessage],
+      model: testModel,
+      apiKey: "test-key", // pragma: allowlist secret
+      signal: controller.signal,
+      reserveTokens: 1000,
+      maxChunkTokens: 50_000,
+      contextWindow: 200_000,
+    });
+    const rejection = expect(promise).rejects.toThrow("aborted");
+    setTimeout(() => controller.abort(), 50);
+    await finishAssertionWithTimers(rejection);
+    const elapsedMs = Date.now() - startedAt;
+
+    // Well under the 500ms minimum backoff — the abort interrupted the sleep.
+    expect(elapsedMs).toBeLessThan(400);
     expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(1);
   });
 
-  it("still attempts partial summarization when oversized messages were excluded", async () => {
+  it("throws CompactionError when both full and partial summarization fail", async () => {
     // Oversized-message fallback tries the safe subset so a huge attachment or
     // tool output does not prevent summarizing the rest of the transcript.
-    agentSessionMocks.estimateTokens.mockImplementation((message: unknown) => {
-      const content =
-        typeof (message as { content?: unknown }).content === "string"
-          ? (message as { content: string }).content
-          : "";
-      return content.length > 10_000 ? 500_000 : 100;
-    });
-
     const messages: AgentMessage[] = [
-      {
-        role: "user",
-        content: "small",
-        timestamp: 1,
-      } satisfies UserMessage,
+      makeUserMessage("small", 1) satisfies UserMessage,
       {
         role: "user",
         content: "x".repeat(500_000),
@@ -162,18 +154,30 @@ describe("summarizeWithFallback", () => {
       } satisfies UserMessage,
     ];
 
-    const result = await summarizeWithFallback({
-      messages,
-      model: testModel,
-      apiKey: "test-key", // pragma: allowlist secret
-      signal: new AbortController().signal,
-      reserveTokens: 1000,
-      maxChunkTokens: 50_000,
-      contextWindow: 200_000,
+    let callCount = 0;
+    agentSessionMocks.generateSummary.mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        return Promise.reject(new Error("full summarization error"));
+      }
+      return Promise.reject(new Error("partial retry error"));
     });
 
-    expect(result).toContain("2 messages (1 oversized)");
-    // Full attempt plus distinct partial transcript; timeout-classed failures do not retry.
-    expect(agentSessionMocks.generateSummary.mock.calls.length).toBe(2);
+    const result = expect(
+      summarizeInStages({
+        parts: 1,
+        messages,
+        model: testModel,
+        apiKey: "test-key", // pragma: allowlist secret
+        signal: new AbortController().signal,
+        reserveTokens: 1000,
+        maxChunkTokens: 50_000,
+        contextWindow: 200_000,
+      }),
+    ).rejects.toThrow(
+      "All summarization attempts failed for 2 messages. Last error: partial retry error",
+    );
+    await finishAssertionWithTimers(result);
+    expect(agentSessionMocks.generateSummary).toHaveBeenCalledTimes(6);
   });
 });

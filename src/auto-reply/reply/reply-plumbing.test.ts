@@ -1,7 +1,10 @@
 // Tests reply plumbing helpers that connect payloads, routes, and delivery modes.
+
+import { expectDefined } from "@openclaw/normalization-core";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SubagentRunRecord } from "../../agents/subagent-registry.js";
-import type { ChannelPlugin } from "../../channels/plugins/types.js";
+import type { SubagentRunRecord } from "../../agents/subagents/registry/subagent-registry.js";
+import { buildSubagentRunView } from "../../agents/subagents/registry/subagent-run-view.js";
+import type { ChannelPlugin } from "../../channels/plugins/types.public.js";
 import type { OpenClawConfig } from "../../config/config.js";
 import { formatDurationCompact } from "../../infra/format-time/format-duration.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
@@ -11,13 +14,8 @@ import {
 } from "../../test-utils/channel-plugins.js";
 import type { TemplateContext } from "../templating.js";
 import { buildThreadingToolContext } from "./agent-runner-utils.js";
-import { applyReplyThreading } from "./reply-payloads.js";
-import {
-  formatRunLabel,
-  formatRunStatus,
-  resolveSubagentLabel,
-  sortSubagentRuns,
-} from "./subagents-utils.js";
+import { applyReplyThreading } from "./reply-payloads-base.js";
+import { formatRunLabel, resolveSubagentLabel } from "./subagents-utils.js";
 
 function createSlackThreadingPlugin(): ChannelPlugin {
   return {
@@ -40,120 +38,59 @@ describe("buildThreadingToolContext", () => {
     resetPluginRuntimeStateForTest();
   });
 
-  it("uses the recipient id for WhatsApp without origin routing metadata", () => {
-    const sessionCtx = {
-      Provider: "whatsapp",
-      From: "123@g.us",
-      To: "+15550001",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe("+15550001");
-  });
-
-  it("falls back to To for WhatsApp when From is missing", () => {
-    const sessionCtx = {
-      Provider: "whatsapp",
-      To: "+15550001",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe("+15550001");
-  });
-
-  it("uses the recipient id for other channels", () => {
-    const sessionCtx = {
-      Provider: "telegram",
-      From: "user:42",
-      To: "chat:99",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe("chat:99");
-  });
-
-  it("uses raw signal direct targets for tool context without provider-specific normalization", () => {
-    const sessionCtx = {
-      Provider: "signal",
-      ChatType: "direct",
-      From: "signal:+15550001",
-      To: "signal:+15550002",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe("signal:+15550002");
-  });
-
-  it("keeps raw signal group ids for tool context", () => {
-    const sessionCtx = {
-      Provider: "signal",
-      ChatType: "group",
-      To: "signal:group:VWATOdKF2hc8zdOS76q9tb0+5BI522e03QLDAq/9yPg=",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe(
+  it.each([
+    [
+      "uses the recipient id for WhatsApp without origin routing metadata",
+      { Provider: "whatsapp", From: "123@g.us", To: "+15550001" },
+      "+15550001",
+    ],
+    [
+      "falls back to To for WhatsApp when From is missing",
+      { Provider: "whatsapp", To: "+15550001" },
+      "+15550001",
+    ],
+    [
+      "uses the recipient id for other channels",
+      { Provider: "telegram", From: "user:42", To: "chat:99" },
+      "chat:99",
+    ],
+    [
+      "uses raw signal direct targets for tool context without provider-specific normalization",
+      {
+        Provider: "signal",
+        ChatType: "direct",
+        From: "signal:+15550001",
+        To: "signal:+15550002",
+      },
+      "signal:+15550002",
+    ],
+    [
+      "keeps raw signal group ids for tool context",
+      {
+        Provider: "signal",
+        ChatType: "group",
+        To: "signal:group:VWATOdKF2hc8zdOS76q9tb0+5BI522e03QLDAq/9yPg=",
+      },
       "signal:group:VWATOdKF2hc8zdOS76q9tb0+5BI522e03QLDAq/9yPg=",
-    );
-  });
-
-  it("uses chat_id for iMessage direct chats without provider-specific normalization", () => {
-    const sessionCtx = {
-      Provider: "imessage",
-      ChatType: "direct",
-      From: "imessage:+15550001",
-      To: "chat_id:12",
-    } as TemplateContext;
-
+    ],
+    [
+      "uses chat_id for iMessage direct chats without provider-specific normalization",
+      { Provider: "imessage", ChatType: "direct", From: "imessage:+15550001", To: "chat_id:12" },
+      "chat_id:12",
+    ],
+    [
+      "uses chat_id for iMessage groups",
+      { Provider: "imessage", ChatType: "group", From: "imessage:group:7", To: "chat_id:7" },
+      "chat_id:7",
+    ],
+  ])("%s", (_name, sessionCtx, expectedChannelId) => {
     const result = buildThreadingToolContext({
-      sessionCtx,
+      sessionCtx: { ...sessionCtx } as TemplateContext,
       config: cfg,
       hasRepliedRef: undefined,
     });
 
-    expect(result.currentChannelId).toBe("chat_id:12");
-  });
-
-  it("uses chat_id for iMessage groups", () => {
-    const sessionCtx = {
-      Provider: "imessage",
-      ChatType: "group",
-      From: "imessage:group:7",
-      To: "chat_id:7",
-    } as TemplateContext;
-
-    const result = buildThreadingToolContext({
-      sessionCtx,
-      config: cfg,
-      hasRepliedRef: undefined,
-    });
-
-    expect(result.currentChannelId).toBe("chat_id:7");
+    expect(result.currentChannelId).toBe(expectedChannelId);
   });
 
   it("uses raw Slack channel ids without implicit thread context", () => {
@@ -263,7 +200,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("42");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
   });
 
   it("threads only first payload when mode is 'first'", () => {
@@ -274,8 +211,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(2);
-    expect(result[0].replyToId).toBe("42");
-    expect(result[1].replyToId).toBeUndefined();
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
+    expect(expectDefined(result[1], "result[1] test invariant").replyToId).toBeUndefined();
   });
 
   it("threads only first payload when mode is 'batched' and the turn is batched", () => {
@@ -287,8 +224,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(2);
-    expect(result[0].replyToId).toBe("42");
-    expect(result[1].replyToId).toBeUndefined();
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
+    expect(expectDefined(result[1], "result[1] test invariant").replyToId).toBeUndefined();
   });
 
   it("can disable implicit reply threading for the current turn", () => {
@@ -300,7 +237,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBeUndefined();
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBeUndefined();
   });
 
   it("still honors explicit reply tags when implicit reply threading is disabled", () => {
@@ -312,7 +249,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("42");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
   });
 
   it("threads all payloads when mode is 'all'", () => {
@@ -323,8 +260,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(2);
-    expect(result[0].replyToId).toBe("42");
-    expect(result[1].replyToId).toBe("42");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
+    expect(expectDefined(result[1], "result[1] test invariant").replyToId).toBe("42");
   });
 
   it("strips replyToId when mode is 'off'", () => {
@@ -335,7 +272,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBeUndefined();
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBeUndefined();
   });
 
   it("does not bypass off mode for Slack when reply is implicit", () => {
@@ -347,7 +284,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBeUndefined();
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBeUndefined();
   });
 
   it("keeps explicit tags for Slack when off mode allows explicit tags", () => {
@@ -359,8 +296,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("42");
-    expect(result[0].replyToTag).toBe(true);
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToTag).toBe(true);
   });
 
   it("keeps explicit tags for Telegram when off mode is enabled", () => {
@@ -372,8 +309,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("42");
-    expect(result[0].replyToTag).toBe(true);
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("42");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToTag).toBe(true);
   });
 
   it("resolves [[reply_to_current]] to currentMessageId when replyToMode is 'all'", () => {
@@ -386,9 +323,9 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("mm-post-abc123");
-    expect(result[0].replyToTag).toBe(true);
-    expect(result[0].text).toBe("some reply text");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("mm-post-abc123");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToTag).toBe(true);
+    expect(expectDefined(result[0], "result[0] test invariant").text).toBe("some reply text");
   });
 
   it("resolves [[reply_to:<id>]] to explicit id when replyToMode is 'all'", () => {
@@ -399,8 +336,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("mm-post-xyz789");
-    expect(result[0].text).toBe("threaded reply");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("mm-post-xyz789");
+    expect(expectDefined(result[0], "result[0] test invariant").text).toBe("threaded reply");
   });
 
   it("prefers explicit reply_to over reply_to_current when both tags are present", () => {
@@ -411,8 +348,8 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("mm-post-xyz789");
-    expect(result[0].text).toBe("hi");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("mm-post-xyz789");
+    expect(expectDefined(result[0], "result[0] test invariant").text).toBe("hi");
   });
 
   it("sets replyToId via implicit threading when replyToMode is 'all'", () => {
@@ -425,7 +362,7 @@ describe("applyReplyThreading auto-threading", () => {
     });
 
     expect(result).toHaveLength(1);
-    expect(result[0].replyToId).toBe("mm-post-abc123");
+    expect(expectDefined(result[0], "result[0] test invariant").replyToId).toBe("mm-post-abc123");
   });
 });
 
@@ -437,7 +374,7 @@ const baseRun: SubagentRunRecord = {
   task: "do thing",
   cleanup: "keep",
   createdAt: 1000,
-  startedAt: 1000,
+  execution: { status: "running", startedAt: 1000 },
 };
 
 describe("subagents utils", () => {
@@ -474,20 +411,33 @@ describe("subagents utils", () => {
 
   it("sorts subagent runs by newest start/created time", () => {
     const runs: SubagentRunRecord[] = [
-      { ...baseRun, runId: "run-1", createdAt: 1000, startedAt: 1000 },
-      { ...baseRun, runId: "run-2", createdAt: 1200, startedAt: 1200 },
-      { ...baseRun, runId: "run-3", createdAt: 900 },
+      {
+        ...baseRun,
+        runId: "run-1",
+        childSessionKey: "agent:main:subagent:run-1",
+        createdAt: 1000,
+        execution: { status: "running", startedAt: 1000 },
+      },
+      {
+        ...baseRun,
+        runId: "run-2",
+        childSessionKey: "agent:main:subagent:run-2",
+        createdAt: 1200,
+        execution: { status: "running", startedAt: 1200 },
+      },
+      {
+        ...baseRun,
+        runId: "run-3",
+        childSessionKey: "agent:main:subagent:run-3",
+        createdAt: 900,
+      },
     ];
-    const sorted = sortSubagentRuns(runs);
-    expect(sorted.map((run) => run.runId)).toEqual(["run-2", "run-1", "run-3"]);
-  });
-
-  it("formats run status from outcome and timestamps", () => {
-    expect(formatRunStatus({ ...baseRun })).toBe("running");
-    expect(formatRunStatus({ ...baseRun, endedAt: 2000, outcome: { status: "ok" } })).toBe("done");
-    expect(formatRunStatus({ ...baseRun, endedAt: 2000, outcome: { status: "timeout" } })).toBe(
-      "timeout",
-    );
+    const view = buildSubagentRunView({
+      runs,
+      recentMinutes: 30,
+      countPendingDescendantRuns: () => 0,
+    });
+    expect(view.latest.map((run) => run.runId)).toEqual(["run-2", "run-1", "run-3"]);
   });
 
   it("formats duration compact for seconds and minutes", () => {

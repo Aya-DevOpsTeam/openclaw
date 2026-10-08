@@ -1,127 +1,155 @@
-import { EventEmitter } from "node:events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { testing } from "./invoke.js";
-
-vi.mock("node:child_process", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:child_process")>();
-  return {
-    ...actual,
-    spawn: vi.fn(),
-  };
-});
-
-const { spawn } = await import("node:child_process");
-
-type MockChild = EventEmitter & {
-  stdout: EventEmitter;
-  stderr: EventEmitter;
-  kill: ReturnType<typeof vi.fn>;
-};
-
-function createMockChild(): MockChild {
-  return Object.assign(new EventEmitter(), {
-    stdout: new EventEmitter(),
-    stderr: new EventEmitter(),
-    kill: vi.fn(),
-  });
-}
-
-function mockNextSpawn(child: MockChild): void {
-  vi.mocked(spawn).mockReturnValue(child as unknown as ReturnType<typeof spawn>);
-}
+import * as processExec from "../process/exec.js";
+import { runCommand } from "./invoke-run-command.js";
 
 describe("runCommand", () => {
   afterEach(() => {
-    vi.useRealTimers();
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
   });
 
-  it.each(["stdout", "stderr"] as const)(
-    "settles after child exit when %s emits an error",
-    async (streamName) => {
-      const child = createMockChild();
-      mockNextSpawn(child);
-
-      const resultPromise = testing.runCommand(["echo", "hello"], undefined, undefined, undefined);
-      child.stdout.emit("data", Buffer.from("captured stdout"));
-      child.stderr.emit("data", Buffer.from("captured stderr"));
-      child[streamName].emit("error", new Error(`${streamName} broke`));
-
-      let settled = false;
-      void resultPromise.then(() => {
-        settled = true;
-      });
-      await Promise.resolve();
-      expect(settled).toBe(false);
-      expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-      child.stdout.emit("error", new Error("later stdout error"));
-      child.stderr.emit("error", new Error("later stderr error"));
-      expect(child.kill).toHaveBeenCalledTimes(1);
-      child.emit("exit", 1);
-
-      await expect(resultPromise).resolves.toEqual({
-        exitCode: 1,
-        timedOut: false,
-        success: false,
-        stdout: "captured stdout",
-        stderr: "captured stderr",
-        error: `${streamName} broke`,
-        truncated: false,
-      });
+  it.each(["before", "after"] as const)(
+    "checks node launch policy %s native execution",
+    async (timing) => {
+      let allowed = timing === "after";
+      const pending = runCommand(
+        [
+          process.execPath,
+          "-e",
+          "process.stdin.resume(); process.stdin.once('end', () => process.stdout.write('completed'))",
+        ],
+        undefined,
+        { PATH: process.env.PATH ?? "" },
+        5_000,
+        undefined,
+        () => {
+          if (!allowed) {
+            throw new Error("exec approval changed before execution");
+          }
+        },
+      );
+      // The canonical node runner spawns synchronously before returning its promise.
+      allowed = false;
+      if (timing === "before") {
+        await expect(pending).rejects.toThrow("exec approval changed before execution");
+      } else {
+        const result = await pending;
+        expect(result.success).toBe(true);
+        expect(result.stdout).toBe("completed");
+      }
     },
   );
 
-  it("escalates stream-error termination when the child does not exit", async () => {
-    vi.useFakeTimers();
-    const child = createMockChild();
-    mockNextSpawn(child);
+  it.runIf(process.platform !== "win32")("preserves signal termination diagnostics", async () => {
+    const result = await runCommand(
+      [process.execPath, "-e", "process.kill(process.pid, 'SIGTERM')"],
+      undefined,
+      undefined,
+      undefined,
+    );
 
-    const resultPromise = testing.runCommand(["slow"], undefined, undefined, undefined);
-    child.stderr.emit("error", new Error("stderr broke"));
-
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-    await vi.advanceTimersByTimeAsync(testing.STREAM_ERROR_KILL_GRACE_MS);
-    expect(child.kill).toHaveBeenLastCalledWith("SIGKILL");
-    child.emit("exit", null);
-    await expect(resultPromise).resolves.toMatchObject({
+    expect(result).toMatchObject({
       exitCode: undefined,
       timedOut: false,
       success: false,
-      error: "stderr broke",
+      stdout: "",
+      stderr: "",
+      error: "Command terminated by signal SIGTERM",
     });
   });
 
-  it("preserves child spawn errors", async () => {
-    const child = createMockChild();
-    mockNextSpawn(child);
+  it.runIf(process.platform !== "win32")("force-kills cancelled command trees", async () => {
+    const controller = new AbortController();
+    const run = processExec.runCommandWithTimeout;
+    vi.spyOn(processExec, "runCommandWithTimeout").mockImplementation((argv, options) =>
+      run(argv, {
+        ...(typeof options === "number" ? { timeoutMs: options } : options),
+        // Cancel only once the real child has installed its signal handler.
+        onOutputChunk: () => controller.abort(),
+      }),
+    );
+    const result = await runCommand(
+      [
+        process.execPath,
+        "-e",
+        "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); process.stdout.write('ready')",
+      ],
+      undefined,
+      undefined,
+      undefined,
+      controller.signal,
+    );
 
-    const resultPromise = testing.runCommand(["missing"], undefined, undefined, undefined);
-    child.emit("error", new Error("spawn failed"));
-
-    await expect(resultPromise).resolves.toMatchObject({
-      exitCode: undefined,
+    expect(result).toMatchObject({
       timedOut: false,
       success: false,
-      error: "spawn failed",
+      stdout: "ready",
+      error: "Command terminated by signal SIGKILL",
     });
-    expect(child.kill).not.toHaveBeenCalled();
   });
 
-  it("preserves timeout termination and exit settlement", async () => {
-    vi.useFakeTimers();
-    const child = createMockChild();
-    mockNextSpawn(child);
+  describe("working directory failures", () => {
+    const enoent = (message: string) =>
+      Object.assign(new Error(message), { code: "ENOENT" }) as NodeJS.ErrnoException;
 
-    const resultPromise = testing.runCommand(["slow"], undefined, undefined, 10);
-    await vi.advanceTimersByTimeAsync(10);
+    async function runCommandError(error: NodeJS.ErrnoException, cwd?: string) {
+      vi.spyOn(processExec, "runCommandWithTimeout").mockRejectedValueOnce(error);
+      return (await runCommand([process.execPath], cwd, undefined, undefined)).error;
+    }
 
-    expect(child.kill).toHaveBeenCalledWith("SIGKILL");
-    child.emit("exit", null);
-    await expect(resultPromise).resolves.toMatchObject({
-      exitCode: undefined,
-      timedOut: true,
-      success: false,
-      error: null,
+    it("flags a cwd that exists but is not a directory", async () => {
+      const file = path.join(os.tmpdir(), `node-exec-file-${process.pid}-${Date.now()}.txt`);
+      fs.writeFileSync(file, "x");
+      try {
+        const result = await runCommand(
+          [process.execPath, "-e", "process.exit(0)"],
+          file,
+          undefined,
+          undefined,
+        );
+        expect(result).toMatchObject({ success: false });
+        expect(result.error).toContain(
+          `node exec working directory is not a directory on the node host: ${file}`,
+        );
+      } finally {
+        fs.rmSync(file, { force: true });
+      }
+    });
+
+    it("clarifies a missing cwd during execution", async () => {
+      const cwd = path.join(os.tmpdir(), `node-exec-run-missing-${process.pid}-${Date.now()}`);
+      const result = await runCommand(
+        [process.execPath, "-e", "process.exit(0)"],
+        cwd,
+        undefined,
+        undefined,
+      );
+      expect(result).toMatchObject({ success: false });
+      expect(result.error).toContain(
+        `node exec working directory does not exist on the node host: ${cwd}`,
+      );
+    });
+
+    it("preserves executable and unrelated errors", async () => {
+      const missingExecutable = "spawn /usr/bin/does-not-exist ENOENT";
+      expect(await runCommandError(enoent(missingExecutable), os.tmpdir())).toBe(missingExecutable);
+      expect(await runCommandError(enoent("spawn /bin/sh ENOENT"), undefined)).toBe(
+        "spawn /bin/sh ENOENT",
+      );
+      const denied = Object.assign(new Error("spawn EACCES"), {
+        code: "EACCES",
+      }) as NodeJS.ErrnoException;
+      expect(await runCommandError(denied, "/missing")).toBe("spawn EACCES");
+    });
+
+    it("preserves the spawn error when the cwd cannot be inspected", async () => {
+      const message = "spawn /bin/sh ENOENT";
+      vi.spyOn(fs, "statSync").mockImplementationOnce(() => {
+        throw Object.assign(new Error("permission denied"), { code: "EACCES" });
+      });
+      expect(await runCommandError(enoent(message), "/unreadable")).toBe(message);
     });
   });
 });
